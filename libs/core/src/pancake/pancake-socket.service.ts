@@ -86,7 +86,7 @@ export class PancakeSocketService implements OnModuleDestroy {
       } catch (error: any) {
         console.error("Reconnect attempt failed:", error.message);
       }
-    }, 5000);
+    }, 30_000);
   }
 
   private async handleWebSocketOpen(
@@ -224,7 +224,7 @@ export class PancakeSocketService implements OnModuleDestroy {
           );
         }
       }
-    }, 60_000);
+    }, 300_000);
   }
 
   private stopAccessTokenHealthCheck() {
@@ -425,49 +425,116 @@ export class PancakeSocketService implements OnModuleDestroy {
     activePages: any[];
   }> {
     let tokens = [...this.accessTokens];
-    while (tokens.length > 0) {
+    const configuredPageIds = new Set(Object.keys(this.pagePrompts ?? {}));
+
+    // Giới hạn số lần thử để tránh loop vô hạn khi API rate-limit.
+    let attempts = 0;
+    const maxAttempts = Math.max(10, tokens.length * 6);
+
+    while (tokens.length > 0 && attempts < maxAttempts) {
+      attempts++;
+
       const randomIndex = Math.floor(Math.random() * tokens.length);
       const accessToken = tokens[randomIndex];
-      // console.log("accessToken:", accessToken);
+
       try {
         const pancakePages = await this.pancakeApiService.listPage({
           accessToken,
         });
+
+        const activatedPageIds: string[] = Array.isArray(
+          pancakePages?.categorized?.activated_page_ids,
+        )
+          ? pancakePages.categorized.activated_page_ids.map((x: any) =>
+              String(x),
+            )
+          : [];
+
         const checkActivedPages =
           await this.pancakeApiService.checkActivedPages({
             accessToken,
-            pageIds: pancakePages?.categorized?.activated_page_ids || [],
+            pageIds: activatedPageIds,
           });
-        // console.log("checkActivedPages:", checkActivedPages);
-        let activePages = checkActivedPages.success
-          ? pancakePages?.categorized?.activated
-          : pancakePages?.categorized?.activated?.filter(({ id }) => {
-              const errorPageIds =
-                checkActivedPages?.errors?.map(({ page_id }: any) => page_id) ||
-                [];
-              return !errorPageIds.includes(id);
-            });
-        // console.log("activePages:", activePages);
-        if (!Array.isArray(activePages)) {
-          activePages = [];
+
+        const activatedObjects = Array.isArray(
+          pancakePages?.categorized?.activated,
+        )
+          ? pancakePages.categorized.activated
+          : [];
+
+        const errorPageIds = new Set(
+          (checkActivedPages?.errors ?? []).map((e: any) =>
+            String(e?.page_id ?? ""),
+          ),
+        );
+
+        let activePages: any[] = [];
+        if (checkActivedPages?.success === true && activatedObjects.length) {
+          activePages = activatedObjects;
+        } else if (activatedObjects.length) {
+          activePages = activatedObjects.filter(({ id }: any) => {
+            const pid = String(id ?? "");
+            return pid && !errorPageIds.has(pid);
+          });
+        }
+
+        // Fallback: nếu API chỉ trả activated_page_ids mà không trả activated object.
+        if (!activePages.length && activatedPageIds.length) {
+          activePages = activatedPageIds.map((id) => ({ id }));
+        }
+
+        // Chỉ giữ các page mà Eve đang cấu hình trong DB cho user.
+        if (configuredPageIds.size > 0) {
+          activePages = activePages.filter(
+            (p: any) => p?.id != null && configuredPageIds.has(String(p.id)),
+          );
         }
 
         if (!activePages.length) {
-          process.exit(1);
+          console.warn(
+            "No active pages resolved for this token (filtered by pagePrompts). Trying another token…",
+          );
+          tokens.splice(randomIndex, 1);
+          this.accessTokens = this.accessTokens.filter(
+            (t) => t !== accessToken,
+          );
+          continue;
         }
 
-        return {
-          accessToken,
-          activePages,
-        };
+        return { accessToken, activePages };
       } catch (error: any) {
+        const statusCode = error?.statusCode ?? error?.response?.status;
+
+        // 429: rate-limited -> giữ token và backoff rồi retry.
+        if (statusCode === 429) {
+          const retryAfterRaw = error?.retryAfter;
+          const retryAfterSec =
+            typeof retryAfterRaw === "string"
+              ? Number.parseInt(retryAfterRaw, 10)
+              : typeof retryAfterRaw === "number"
+                ? retryAfterRaw
+                : NaN;
+
+          const waitMs =
+            Number.isFinite(retryAfterSec) && retryAfterSec > 0
+              ? retryAfterSec * 1000
+              : 2_000 * Math.min(8, attempts);
+
+          console.warn(
+            `Rate limited (429). Waiting ${waitMs}ms then retrying…`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          continue;
+        }
+
         console.error("Error when get random access token:", error.message);
         tokens.splice(randomIndex, 1);
         this.accessTokens = this.accessTokens.filter((t) => t !== accessToken);
         console.warn(`AccessToken died and removed: ${accessToken}`);
       }
     }
+
     console.error("No alive access token found");
-    process.exit(1);
+    throw new Error("No alive Pancake access token or no resolvable pages");
   }
 }

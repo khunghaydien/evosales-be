@@ -17,8 +17,21 @@ export class PancakeApiService {
       });
       return response.data;
     } catch (error: any) {
-      console.error("Error fetching list of pages:", error.message);
-      throw new Error("Failed to fetch list of pages");
+      const statusCode = error?.response?.status;
+      const retryAfterRaw =
+        error?.response?.headers?.["retry-after"] ??
+        error?.response?.headers?.["Retry-After"];
+
+      // Preserve statusCode for callers (used for 429 backoff).
+      const err: any = new Error("Failed to fetch list of pages");
+      err.statusCode = statusCode;
+      err.retryAfter = retryAfterRaw;
+
+      console.error("Error fetching list of pages:", error.message, {
+        statusCode,
+        retryAfter: retryAfterRaw,
+      });
+      throw err;
     }
   }
 
@@ -95,8 +108,20 @@ export class PancakeApiService {
       });
       return response.data;
     } catch (error: any) {
-      console.error("Error checking active pages:", error.message);
-      throw new Error("Failed to check active pages");
+      const statusCode = error?.response?.status;
+      const retryAfterRaw =
+        error?.response?.headers?.["retry-after"] ??
+        error?.response?.headers?.["Retry-After"];
+
+      const err: any = new Error("Failed to check active pages");
+      err.statusCode = statusCode;
+      err.retryAfter = retryAfterRaw;
+
+      console.error("Error checking active pages:", error.message, {
+        statusCode,
+        retryAfter: retryAfterRaw,
+      });
+      throw err;
     }
   }
 
