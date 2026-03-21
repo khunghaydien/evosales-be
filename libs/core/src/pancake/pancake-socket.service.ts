@@ -1,6 +1,6 @@
 import { Injectable, OnModuleDestroy } from "@nestjs/common";
 import WebSocket = require("ws");
-import jwt from "jsonwebtoken";
+import jwt = require("jsonwebtoken");
 import { v4 as uuidv4 } from "uuid";
 import OpenAI from "openai";
 import { PancakeApiService } from "./pancake-api.service";
@@ -427,7 +427,6 @@ export class PancakeSocketService implements OnModuleDestroy {
     let tokens = [...this.accessTokens];
     const configuredPageIds = new Set(Object.keys(this.pagePrompts ?? {}));
 
-    // Giới hạn số lần thử để tránh loop vô hạn khi API rate-limit.
     let attempts = 0;
     const maxAttempts = Math.max(10, tokens.length * 6);
 
@@ -478,12 +477,10 @@ export class PancakeSocketService implements OnModuleDestroy {
           });
         }
 
-        // Fallback: nếu API chỉ trả activated_page_ids mà không trả activated object.
         if (!activePages.length && activatedPageIds.length) {
           activePages = activatedPageIds.map((id) => ({ id }));
         }
 
-        // Chỉ giữ các page mà Eve đang cấu hình trong DB cho user.
         if (configuredPageIds.size > 0) {
           activePages = activePages.filter(
             (p: any) => p?.id != null && configuredPageIds.has(String(p.id)),
@@ -495,9 +492,6 @@ export class PancakeSocketService implements OnModuleDestroy {
             "No active pages resolved for this token (filtered by pagePrompts). Trying another token…",
           );
           tokens.splice(randomIndex, 1);
-          this.accessTokens = this.accessTokens.filter(
-            (t) => t !== accessToken,
-          );
           continue;
         }
 
@@ -505,7 +499,6 @@ export class PancakeSocketService implements OnModuleDestroy {
       } catch (error: any) {
         const statusCode = error?.statusCode ?? error?.response?.status;
 
-        // 429: rate-limited -> giữ token và backoff rồi retry.
         if (statusCode === 429) {
           const retryAfterRaw = error?.retryAfter;
           const retryAfterSec =
@@ -529,8 +522,7 @@ export class PancakeSocketService implements OnModuleDestroy {
 
         console.error("Error when get random access token:", error.message);
         tokens.splice(randomIndex, 1);
-        this.accessTokens = this.accessTokens.filter((t) => t !== accessToken);
-        console.warn(`AccessToken died and removed: ${accessToken}`);
+        console.warn(`Token failed in this attempt, trying another token`);
       }
     }
 
