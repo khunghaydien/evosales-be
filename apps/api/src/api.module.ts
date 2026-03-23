@@ -6,6 +6,7 @@ import { UsersModule } from "./users/users.module";
 import { AuthModule } from "./auth/auth.module";
 import { PagesModule } from "./pages/pages.module";
 import { KnowledgeEmbeddingsModule } from "./knowledge-embeddings/knowledge-embeddings.module";
+import { ConversationsModule } from "./conversations/conversations.module";
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { KnowledgeEmbeddingsModule } from "./knowledge-embeddings/knowledge-embe
     AuthModule,
     PagesModule,
     KnowledgeEmbeddingsModule,
+    ConversationsModule,
   ],
   controllers: [ApiController],
   providers: [ApiService],

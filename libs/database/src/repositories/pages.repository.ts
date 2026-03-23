@@ -16,6 +16,8 @@ export class PagesRepository {
       pageId: string;
       accessTokens: string[];
       salePrompt?: string | null;
+      orderShipConfig?: Record<string, unknown> | null;
+      orderCollectionConfig?: Record<string, unknown> | null;
     },
   ) {
     const page = this.repo.create({
@@ -23,6 +25,8 @@ export class PagesRepository {
       pageId: data.pageId,
       accessTokens: data.accessTokens,
       salePrompt: data.salePrompt ?? null,
+      orderShipConfig: data.orderShipConfig ?? null,
+      orderCollectionConfig: data.orderCollectionConfig ?? null,
     });
     return this.repo.save(page);
   }
@@ -42,7 +46,12 @@ export class PagesRepository {
   async updateForUser(
     userId: string,
     id: string,
-    data: { accessTokens?: string[]; salePrompt?: string | null },
+    data: {
+      accessTokens?: string[];
+      salePrompt?: string | null;
+      orderShipConfig?: Record<string, unknown> | null;
+      orderCollectionConfig?: Record<string, unknown> | null;
+    },
   ) {
     const page = await this.repo.findOne({ where: { id, userId } });
     if (!page) {
@@ -53,6 +62,12 @@ export class PagesRepository {
     }
     if (data.salePrompt !== undefined) {
       page.salePrompt = data.salePrompt ?? null;
+    }
+    if (data.orderShipConfig !== undefined) {
+      page.orderShipConfig = data.orderShipConfig ?? null;
+    }
+    if (data.orderCollectionConfig !== undefined) {
+      page.orderCollectionConfig = data.orderCollectionConfig ?? null;
     }
     return this.repo.save(page);
   }

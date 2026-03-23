@@ -62,8 +62,23 @@ export class EveService implements OnModuleInit {
     }
 
     const pagePrompts: Record<string, string | null> = {};
+    const pageOrderConfigs: Record<
+      string,
+      {
+        orderShipConfig: Record<string, unknown> | null;
+        orderCollectionConfig: Record<string, unknown> | null;
+      }
+    > = {};
     for (const page of pages) {
       pagePrompts[page.pageId] = page.salePrompt ?? null;
+      pageOrderConfigs[page.pageId] = {
+        orderShipConfig: page.orderShipConfig ?? null,
+        orderCollectionConfig: page.orderCollectionConfig ?? null,
+      };
+    }
+    const pageDbIds: Record<string, string> = {};
+    for (const page of pages) {
+      pageDbIds[page.pageId] = page.id;
     }
 
     // eslint-disable-next-line no-console
@@ -71,6 +86,11 @@ export class EveService implements OnModuleInit {
       `Starting Pancake socket for user ${email} with ${pages.length} pages`,
     );
 
-    await this.pancakeSocketService.connectWebSocket(accessTokens, pagePrompts);
+    await this.pancakeSocketService.connectWebSocket(
+      accessTokens,
+      pagePrompts,
+      pageOrderConfigs,
+      pageDbIds,
+    );
   }
 }

@@ -12,6 +12,8 @@ export class PagesService {
       pageId: dto.pageId,
       accessTokens: dto.accessTokens,
       salePrompt: dto.salePrompt,
+      orderShipConfig: dto.orderShipConfig,
+      orderCollectionConfig: dto.orderCollectionConfig,
     });
   }
 
@@ -27,6 +29,8 @@ export class PagesService {
     return this.pagesRepo.updateForUser(userId, id, {
       accessTokens: dto.accessTokens,
       salePrompt: dto.salePrompt,
+      orderShipConfig: dto.orderShipConfig,
+      orderCollectionConfig: dto.orderCollectionConfig,
     });
   }
 

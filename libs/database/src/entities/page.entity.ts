@@ -28,6 +28,15 @@ export class PageEntity {
   @Column("text", { name: "sale_prompt", nullable: true })
   salePrompt: string | null;
 
+  // Cấu hình điều kiện để chuyển trạng thái conversation sang shipping/ordered.
+  // Ví dụ: { "required": ["phone", "address"] }
+  @Column("jsonb", { name: "order_ship_config", nullable: true })
+  orderShipConfig: Record<string, unknown> | null;
+
+  // Ví dụ: { "required": ["quantity", "combo", "color"] }
+  @Column("jsonb", { name: "order_collection_config", nullable: true })
+  orderCollectionConfig: Record<string, unknown> | null;
+
   @Column("timestamptz", { name: "created_at", default: () => "now()" })
   createdAt: Date;
 

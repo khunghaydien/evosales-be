@@ -8,10 +8,16 @@ import "dotenv/config";
 async function bootstrap() {
   const app = await NestFactory.create(ApiModule);
   app.enableCors({
-    origin: "*",
-    credentials: false,
+    origin: true,
+    credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: "*",
+    allowedHeaders: [
+      "Origin",
+      "X-Requested-With",
+      "Content-Type",
+      "Accept",
+      "Authorization",
+    ],
   });
   app.setGlobalPrefix("api");
   app.useGlobalPipes(

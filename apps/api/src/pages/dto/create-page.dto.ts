@@ -1,4 +1,4 @@
-import { IsArray, IsOptional, IsString } from "class-validator";
+import { IsArray, IsObject, IsOptional, IsString } from "class-validator";
 
 export class CreatePageDto {
   @IsString()
@@ -11,4 +11,12 @@ export class CreatePageDto {
   @IsOptional()
   @IsString()
   salePrompt?: string | null;
+
+  @IsOptional()
+  @IsObject()
+  orderShipConfig?: Record<string, unknown>;
+
+  @IsOptional()
+  @IsObject()
+  orderCollectionConfig?: Record<string, unknown>;
 }

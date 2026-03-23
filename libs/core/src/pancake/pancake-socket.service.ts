@@ -3,12 +3,53 @@ import WebSocket = require("ws");
 import jwt = require("jsonwebtoken");
 import { v4 as uuidv4 } from "uuid";
 import OpenAI from "openai";
+import { DataSource } from "typeorm";
 import { PancakeApiService } from "./pancake-api.service";
+import {
+  ConversationEntity,
+  ConversationStatus,
+} from "@app/database/entities/conversation.entity";
 
 type HistoryItem = {
   message: string;
   type: "system" | "human";
   image_urls?: string[];
+};
+
+type SessionStep =
+  | "idle"
+  | "collect_order"
+  | "collect_shipping"
+  | "confirm"
+  | "done";
+
+type ConversationSession = {
+  conversationId: string;
+  pageExternalId: string;
+  pageDbId: string;
+  intent: string | null;
+  order_info: {
+    product_name?: string;
+    variant?: string;
+    size?: string;
+    quantity?: number;
+    notes?: string;
+    combo?: number;
+    color?: string;
+  };
+  shipping_info: {
+    name?: string;
+    phone?: string;
+    address?: string;
+  };
+  step: SessionStep;
+};
+
+type ExtractorResult = {
+  intent: { type: string; confidence: number };
+  order_info: Record<string, unknown>;
+  shipping_info: Record<string, unknown>;
+  thanks: boolean;
 };
 
 @Injectable()
@@ -23,9 +64,45 @@ export class PancakeSocketService implements OnModuleDestroy {
   private currentAccessToken: string;
   private currentActivePages: any[];
   private pagePrompts: Record<string, string | null> = {};
+  private pageOrderConfigs: Record<
+    string,
+    {
+      orderShipConfig: Record<string, unknown> | null;
+      orderCollectionConfig: Record<string, unknown> | null;
+    }
+  > = {};
+  private pageDbIds: Record<string, string> = {};
   private readonly openai = new OpenAI();
+  private readonly recentlyHandledConversations = new Map<string, number>();
+  private readonly fieldAliases: Record<string, string[]> = {
+    product_name: ["type", "product", "name", "variant"],
+    type: ["product_name", "product", "name", "variant"],
+    variant: ["type", "product_name"],
+    quantity: ["qty", "so_luong", "soLuong"],
+    color: ["mau", "màu"],
+    size: ["kich_co", "kích_cỡ", "kichco"],
+    combo: ["set"],
+    phone: ["phone_number", "sdt", "so_dien_thoai", "soDienThoai"],
+    address: ["dia_chi", "diaChi"],
+    name: ["customer_name", "ten", "ho_ten", "hoTen"],
+  };
+  private readonly fieldLabelMap: Record<string, string> = {
+    product_name: "sản phẩm",
+    type: "sản phẩm",
+    variant: "phân loại",
+    quantity: "số lượng",
+    combo: "combo",
+    color: "màu sắc",
+    size: "size",
+    phone: "số điện thoại",
+    address: "địa chỉ nhận hàng",
+    name: "tên người nhận",
+  };
 
-  constructor(private readonly pancakeApiService: PancakeApiService) {}
+  constructor(
+    private readonly pancakeApiService: PancakeApiService,
+    private readonly dataSource: DataSource,
+  ) {}
 
   async onModuleDestroy() {
     this.closeWebSocket();
@@ -34,10 +111,20 @@ export class PancakeSocketService implements OnModuleDestroy {
   async connectWebSocket(
     accessTokens: string[],
     pagePrompts?: Record<string, string | null>,
+    pageOrderConfigs?: Record<
+      string,
+      {
+        orderShipConfig: Record<string, unknown> | null;
+        orderCollectionConfig: Record<string, unknown> | null;
+      }
+    >,
+    pageDbIds?: Record<string, string>,
   ): Promise<void> {
     try {
       this.accessTokens = accessTokens;
       this.pagePrompts = pagePrompts ?? {};
+      this.pageOrderConfigs = pageOrderConfigs ?? {};
+      this.pageDbIds = pageDbIds ?? {};
       const { accessToken, activePages } = await this.getRandomAccessToken();
       this.currentAccessToken = accessToken;
       this.currentActivePages = activePages;
@@ -79,7 +166,12 @@ export class PancakeSocketService implements OnModuleDestroy {
     this.reconnectInterval = setInterval(async () => {
       console.log("Attempting to reconnect WebSocket...");
       try {
-        await this.connectWebSocket(this.accessTokens);
+        await this.connectWebSocket(
+          this.accessTokens,
+          this.pagePrompts,
+          this.pageOrderConfigs,
+          this.pageDbIds,
+        );
         clearInterval(this.reconnectInterval);
         this.isReconnecting = false;
         console.log("WebSocket reconnected successfully!");
@@ -142,15 +234,11 @@ export class PancakeSocketService implements OnModuleDestroy {
       const eventType = parsedMessage[3];
       const payload = parsedMessage[4];
       const { page_id: pageId, conversation } = payload;
-      const hasSomeTags = conversation?.tags?.some((tag) => tag >= 0);
-
-      if (hasSomeTags) {
-        console.log(
-          "Event type is not a new message, has tags:",
-          conversation?.tags,
-        );
-        return;
-      }
+      const completedTagId = Number(process.env.PANCAKE_COMPLETED_TAG_ID);
+      const hasCompletedTag =
+        Number.isFinite(completedTagId) &&
+        Array.isArray(conversation?.tags) &&
+        conversation.tags.map((t: any) => Number(t)).includes(completedTagId);
 
       if (eventType !== "pages:update_conversation") {
         console.log("Event type is not a new message:", eventType);
@@ -171,6 +259,14 @@ export class PancakeSocketService implements OnModuleDestroy {
         return;
       }
 
+      if (hasCompletedTag) {
+        console.log(
+          "Skip because conversation has completed tag:",
+          completedTagId,
+        );
+        return;
+      }
+
       if (isSentByBot) {
         console.log("Message sent by bot, ignoring...");
         return;
@@ -178,6 +274,37 @@ export class PancakeSocketService implements OnModuleDestroy {
 
       if (conversation.assignee_ids?.length || conversation.assignee_group_id) {
         console.log("Message assigned to someone else, ignoring...");
+        return;
+      }
+
+      const conversationId = String(conversation.id);
+      const externalPageId = String(pageId);
+      const dbPageId = this.pageDbIds[externalPageId];
+      if (!dbPageId) {
+        console.warn(
+          `Missing page mapping for external pageId=${externalPageId}`,
+        );
+        return;
+      }
+      const now = Date.now();
+      const lastHandledAt =
+        this.recentlyHandledConversations.get(conversationId);
+      if (lastHandledAt && now - lastHandledAt < 10_000) {
+        console.log("Skip duplicate conversation update");
+        return;
+      }
+      this.recentlyHandledConversations.set(conversationId, now);
+
+      const conversationRepo =
+        this.dataSource.getRepository(ConversationEntity);
+      const existing = await conversationRepo.findOne({
+        where: {
+          pageId: dbPageId,
+          externalConversationId: conversationId,
+        },
+      });
+      if (existing?.status === ConversationStatus.SOLD) {
+        console.log("Skip because conversation status is SOLD");
         return;
       }
 
@@ -257,12 +384,20 @@ export class PancakeSocketService implements OnModuleDestroy {
   ): Promise<void> {
     try {
       const { accessToken } = await this.getRandomAccessToken();
+      const externalPageId = String(pageId);
+      const dbPageId = this.pageDbIds[externalPageId];
+      if (!dbPageId) {
+        console.warn(
+          `Missing page mapping for external pageId=${externalPageId} (sendBackMessage)`,
+        );
+        return;
+      }
       const conversationId = conversation?.id;
       const customerId = conversation?.customers?.[0]?.id || "";
 
-      if (!pageId || !conversationId || !customerId) {
+      if (!externalPageId || !conversationId || !customerId) {
         console.warn("Missing get messages params:", {
-          pageId,
+          pageId: externalPageId,
           conversationId,
           customerId,
         });
@@ -270,7 +405,7 @@ export class PancakeSocketService implements OnModuleDestroy {
       }
 
       const { messages } = await this.pancakeApiService.getMessages({
-        pageId,
+        pageId: externalPageId,
         conversationId,
         accessToken,
         customerId,
@@ -320,94 +455,488 @@ export class PancakeSocketService implements OnModuleDestroy {
         };
       });
 
-      const salePrompt = this.pagePrompts[pageId] ?? null;
-
-      const response = await this.getResponseFromOpenAI({
-        conversationId,
-        messages: historyMessage,
-        salePrompt,
+      const extracted = await this.extractIntentAndOrderInfoByAI({
+        history: historyMessage,
+        pageId: externalPageId,
       });
 
-      if (!response.length) {
-        console.log("No response from OpenAI");
+      const existing = await this.dataSource
+        .getRepository(ConversationEntity)
+        .findOne({
+          where: {
+            pageId: dbPageId,
+            externalConversationId: String(conversationId),
+          },
+        });
+
+      let session = this.buildSession({
+        conversationId: String(conversationId),
+        pageExternalId: externalPageId,
+        pageDbId: dbPageId,
+        existing,
+      });
+
+      session = this.mergeSession(session, extracted);
+      session = this.canonicalizeSessionByRequiredFields(session);
+      session = this.nextStep(session);
+      session = this.applyIntentTransitions(session, extracted.intent.type);
+      const { orderMissing, shipMissing } = this.getMissingFields(session);
+      console.log("[conversation] session synced", {
+        conversationId: String(conversationId),
+        pageId: externalPageId,
+        intent: session.intent,
+        step: session.step,
+        orderKeys: Object.keys(session.order_info ?? {}),
+        shippingKeys: Object.keys(session.shipping_info ?? {}),
+        orderMissing,
+        shipMissing,
+      });
+
+      // Persist memory + state machine result into conversations table.
+      await this.saveSession(session, existing);
+
+      if (session.step === "done") {
+        await this.pancakeApiService.sendInbox({
+          data: {
+            message: "Đơn của bạn đã được ghi nhận, bên mình sẽ xử lý sớm ạ ❤️",
+          },
+          pageId,
+          conversationId,
+          accessToken,
+        });
         return;
       }
 
-      const delay = (ms: number) =>
-        new Promise((resolve) => setTimeout(resolve, ms));
-
-      response.forEach(async (item) => {
-        if (item.content === "no_response") {
-          console.log("no_response");
-          return;
-        }
-
-        const sentences = item.content
-          .split(".")
-          .map((s) => s.trim())
-          .filter((s) => s.length > 0);
-
-        for (const sentence of sentences) {
-          await this.pancakeApiService.sendInbox({
-            data: {
-              message: sentence.replace(/(\\n)+/g, "\r\n"),
-            },
-            pageId,
-            conversationId,
-            accessToken,
-          });
-          await delay(100);
-        }
+      const reply = this.generateResponse(session);
+      if (!reply) return;
+      await this.pancakeApiService.sendInbox({
+        data: { message: reply.replace(/(\\n)+/g, "\r\n") },
+        pageId,
+        conversationId,
+        accessToken,
       });
     } catch (error: any) {
       console.error("Error send back message :", error.message);
     }
   }
 
-  private async getResponseFromOpenAI(request: {
-    conversationId: string;
-    messages: HistoryItem[];
-    salePrompt?: string | null;
-  }): Promise<{ content: string; attach_files: string[] }[]> {
-    const { messages, salePrompt } = request;
-    try {
-      const chatMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
-        [
+  private async extractIntentAndOrderInfoByAI(params: {
+    history: HistoryItem[];
+    pageId: string;
+  }): Promise<{
+    intent: { type: string; confidence: number };
+    order_info: Record<string, unknown>;
+    shipping_info: Record<string, unknown>;
+    thanks: boolean;
+  }> {
+    const { history, pageId } = params;
+    const { orderRequired, shipRequired } = this.getPageRequiredFields(pageId);
+    console.log("[extractor] start", {
+      pageId,
+      historyCount: history.length,
+      latestMessagePreview: String(
+        history[history.length - 1]?.message ?? "",
+      ).slice(0, 120),
+      orderRequired,
+      shipRequired,
+    });
+
+    const chatMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+      {
+        role: "system",
+        content:
+          "Bạn là bộ trích xuất dữ liệu hội thoại bán hàng. Trả về JSON hợp lệ duy nhất, không thêm markdown.",
+      },
+      {
+        role: "user",
+        content: JSON.stringify(
           {
-            role: "system",
-            content: `${salePrompt}`,
+            task: "extract_conversation_intent_and_fields",
+            allowedIntent: [
+              "question",
+              "order",
+              "info",
+              "update",
+              "confirm_order",
+              "cancel_order",
+            ],
+            requiredOrderFields: orderRequired,
+            requiredShippingFields: shipRequired,
+            schema: {
+              intent: "{ type: string, confidence: number }",
+              thanks: "boolean",
+              order_info: "object",
+              shipping_info: "object",
+            },
+            rules: [
+              "chỉ trích xuất field xuất hiện rõ trong hội thoại, không bịa",
+              "nếu chưa rõ thì bỏ trống object tương ứng",
+              "intent=question khi khách chủ yếu đang hỏi",
+              "intent=order khi khách cung cấp/chốt thông tin đơn",
+              "intent=info khi là thông tin chung khác",
+              "intent=update khi khách sửa thông tin đã cung cấp",
+              "intent=confirm_order khi khách xác nhận chốt đơn",
+              "intent=cancel_order khi khách hủy đơn hoặc nói không mua",
+            ],
+            history,
           },
-        ];
+          null,
+          2,
+        ),
+      },
+    ];
 
-      for (const m of messages) {
-        chatMessages.push({
-          role: m.type === "human" ? "user" : "assistant",
-          content: m.message,
-        });
-      }
-
+    try {
       const completion = await this.openai.chat.completions.create({
         model: "gpt-4.1-mini",
         messages: chatMessages,
+        response_format: { type: "json_object" },
       });
 
-      const content =
-        completion.choices[0]?.message?.content?.toString().trim() || "";
-
-      if (!content) {
-        return [];
+      const raw = completion.choices[0]?.message?.content?.toString().trim();
+      if (!raw) {
+        console.warn("[extractor] empty response");
+        return {
+          intent: { type: "info", confidence: 0 },
+          order_info: {},
+          shipping_info: {},
+          thanks: false,
+        };
       }
 
-      return [
-        {
-          content,
-          attach_files: [],
-        },
-      ];
+      const parsed = JSON.parse(raw);
+      console.log("[extractor] raw parsed keys", {
+        intentType: parsed?.intent?.type ?? parsed?.intent,
+        hasOrderInfo: Boolean(parsed?.order_info),
+        hasShippingInfo: Boolean(parsed?.shipping_info),
+        thanks: Boolean(parsed?.thanks),
+      });
+      const intentType =
+        typeof parsed?.intent?.type === "string"
+          ? parsed.intent.type
+          : typeof parsed?.intent === "string"
+            ? parsed.intent
+            : "info";
+      const confidence =
+        typeof parsed?.intent?.confidence === "number"
+          ? Math.max(0, Math.min(1, parsed.intent.confidence))
+          : 0.5;
+      const normalized = {
+        intent: { type: intentType, confidence },
+        order_info:
+          parsed?.order_info && typeof parsed.order_info === "object"
+            ? parsed.order_info
+            : {},
+        shipping_info:
+          parsed?.shipping_info && typeof parsed.shipping_info === "object"
+            ? parsed.shipping_info
+            : {},
+        thanks: Boolean(parsed?.thanks),
+      };
+      console.log("[extractor] normalized result", {
+        intent: normalized.intent,
+        orderFields: Object.keys(normalized.order_info),
+        shippingFields: Object.keys(normalized.shipping_info),
+        thanks: normalized.thanks,
+      });
+
+      return normalized;
     } catch (error: any) {
-      console.error("Error when get response from OpenAI:", error.message);
-      return [];
+      console.error("AI extractor failed:", error?.message);
+      return {
+        intent: { type: "info", confidence: 0 },
+        order_info: {},
+        shipping_info: {},
+        thanks: false,
+      };
     }
+  }
+
+  private removeNull(obj: Record<string, unknown> | null | undefined) {
+    return Object.fromEntries(
+      Object.entries(obj || {}).filter(
+        ([, v]) => v !== null && v !== undefined,
+      ),
+    );
+  }
+
+  private buildSession(params: {
+    conversationId: string;
+    pageExternalId: string;
+    pageDbId: string;
+    existing: ConversationEntity | null;
+  }): ConversationSession {
+    const { conversationId, pageExternalId, pageDbId, existing } = params;
+    const status = existing?.status ?? ConversationStatus.NEVER_MESSAGED;
+
+    let step: SessionStep = "idle";
+    if (status === ConversationStatus.ORDER_INFO_COLLECTED) {
+      step = "collect_shipping";
+    } else if (status === ConversationStatus.SHIPPING_INFO_COLLECTED) {
+      step = "confirm";
+    } else if (status === ConversationStatus.SOLD) {
+      step = "done";
+    }
+
+    return {
+      conversationId,
+      pageExternalId,
+      pageDbId,
+      intent: null,
+      order_info: ((existing?.orderInfo as Record<string, unknown>) ??
+        {}) as any,
+      shipping_info: ((existing?.shippingInfo as Record<string, unknown>) ??
+        {}) as any,
+      step,
+    };
+  }
+
+  private mergeSession(
+    session: ConversationSession,
+    extracted: ExtractorResult,
+  ): ConversationSession {
+    return {
+      ...session,
+      intent: extracted.intent?.type || session.intent,
+      order_info: {
+        ...session.order_info,
+        ...this.removeNull(extracted.order_info),
+      },
+      shipping_info: {
+        ...session.shipping_info,
+        ...this.removeNull(extracted.shipping_info),
+      },
+    };
+  }
+
+  private nextStep(session: ConversationSession): ConversationSession {
+    const { orderMissing, shipMissing } = this.getMissingFields(session);
+    if (orderMissing.length > 0) return { ...session, step: "collect_order" };
+    if (shipMissing.length > 0) return { ...session, step: "collect_shipping" };
+    return { ...session, step: "confirm" };
+  }
+
+  private applyIntentTransitions(
+    session: ConversationSession,
+    intentType: string,
+  ): ConversationSession {
+    const i = (intentType || "").toLowerCase();
+    if (i === "cancel_order") {
+      return {
+        ...session,
+        intent: i,
+        order_info: {},
+        shipping_info: {},
+        step: "idle",
+      };
+    }
+    if (session.step === "confirm" && i === "confirm_order") {
+      return { ...session, intent: i, step: "done" };
+    }
+    return { ...session, intent: i || session.intent };
+  }
+
+  private async saveSession(
+    session: ConversationSession,
+    existing: ConversationEntity | null,
+  ): Promise<void> {
+    const repo = this.dataSource.getRepository(ConversationEntity);
+
+    let status: ConversationStatus = ConversationStatus.NEVER_MESSAGED;
+    if (session.step === "collect_shipping") {
+      status = ConversationStatus.ORDER_INFO_COLLECTED;
+    } else if (session.step === "confirm") {
+      status = ConversationStatus.SHIPPING_INFO_COLLECTED;
+    } else if (session.step === "done") {
+      status = ConversationStatus.SOLD;
+    }
+
+    if (existing) {
+      existing.orderInfo = session.order_info as any;
+      existing.shippingInfo = session.shipping_info as any;
+      existing.status = status;
+      existing.updatedAt = new Date();
+      await repo.save(existing);
+      return;
+    }
+
+    const created = repo.create({
+      pageId: session.pageDbId,
+      externalConversationId: session.conversationId,
+      status,
+      orderInfo: session.order_info as any,
+      shippingInfo: session.shipping_info as any,
+    });
+    await repo.save(created);
+  }
+
+  private generateResponse(session: ConversationSession): string {
+    const { orderMissing, shipMissing } = this.getMissingFields(session);
+    const allMissing = [...orderMissing, ...shipMissing];
+    switch (session.step) {
+      case "idle":
+        if (allMissing.length > 0) {
+          return `a/c cho e xin ${this.toFieldList(allMissing)} để e lên đơn cho mk ạ`;
+        }
+        return "Mình có thể giúp gì cho bạn ạ?";
+      case "collect_order":
+        if (allMissing.length > 0) {
+          return `a/c cho e xin ${this.toFieldList(allMissing)} để e lên đơn cho mk ạ`;
+        }
+        return "a/c cho e xác nhận giúp đơn để e lên đơn cho mk ạ";
+      case "collect_shipping":
+        if (allMissing.length > 0) {
+          return `a/c cho e xin ${this.toFieldList(allMissing)} để e lên đơn cho mk ạ`;
+        }
+        return "a/c cho e xác nhận giúp thông tin nhận hàng để e lên đơn cho mk ạ";
+      case "confirm":
+        return [
+          "Xác nhận đơn giúp mình:",
+          "",
+          `- Sản phẩm: ${session.order_info.product_name || "chưa có"}`,
+          `- Số lượng: ${session.order_info.quantity || "chưa có"}`,
+          `- Màu sắc: ${session.order_info.color || "không có"}`,
+          `- SĐT: ${session.shipping_info.phone || "chưa có"}`,
+          `- Địa chỉ: ${session.shipping_info.address || "chưa có"}`,
+          "",
+          "Bạn xác nhận giúp mình nhé?",
+        ].join("\n");
+      case "done":
+        return "Đơn của bạn đã được ghi nhận, bên mình sẽ xử lý sớm ạ ❤️";
+      default:
+        return "Mình có thể giúp gì cho bạn?";
+    }
+  }
+
+  private getMissingFields(session: ConversationSession): {
+    orderMissing: string[];
+    shipMissing: string[];
+  } {
+    const { orderRequired, shipRequired } = this.getPageRequiredFields(
+      session.pageExternalId,
+    );
+    const orderMissing = orderRequired.filter(
+      (field) => !this.hasFieldValue(session.order_info, field),
+    );
+    const shipMissing = shipRequired.filter(
+      (field) => !this.hasFieldValue(session.shipping_info, field),
+    );
+    return { orderMissing, shipMissing };
+  }
+
+  private canonicalizeSessionByRequiredFields(
+    session: ConversationSession,
+  ): ConversationSession {
+    const { orderRequired, shipRequired } = this.getPageRequiredFields(
+      session.pageExternalId,
+    );
+    const nextOrderInfo = { ...session.order_info } as Record<string, unknown>;
+    const nextShippingInfo = {
+      ...session.shipping_info,
+    } as Record<string, unknown>;
+
+    for (const field of orderRequired) {
+      if (this.isFilledValue(nextOrderInfo[field])) {
+        continue;
+      }
+      const value = this.resolveFieldValue(nextOrderInfo, field);
+      if (this.isFilledValue(value)) {
+        nextOrderInfo[field] = value;
+      }
+    }
+
+    for (const field of shipRequired) {
+      if (this.isFilledValue(nextShippingInfo[field])) {
+        continue;
+      }
+      const value = this.resolveFieldValue(nextShippingInfo, field);
+      if (this.isFilledValue(value)) {
+        nextShippingInfo[field] = value;
+      }
+    }
+
+    return {
+      ...session,
+      order_info: nextOrderInfo as ConversationSession["order_info"],
+      shipping_info: nextShippingInfo as ConversationSession["shipping_info"],
+    };
+  }
+
+  private resolveFieldValue(
+    source: Record<string, unknown>,
+    field: string,
+  ): unknown {
+    const directValue = source?.[field];
+    if (this.isFilledValue(directValue)) {
+      return directValue;
+    }
+    const aliases = this.fieldAliases[field] ?? [];
+    for (const alias of aliases) {
+      const aliasValue = source?.[alias];
+      if (this.isFilledValue(aliasValue)) {
+        return aliasValue;
+      }
+    }
+    return undefined;
+  }
+
+  private hasFieldValue(
+    source: Record<string, unknown>,
+    field: string,
+  ): boolean {
+    const directValue = source?.[field];
+    if (this.isFilledValue(directValue)) {
+      return true;
+    }
+    const aliases = this.fieldAliases[field] ?? [];
+    return aliases.some((alias) => this.isFilledValue(source?.[alias]));
+  }
+
+  private isFilledValue(value: unknown): boolean {
+    if (value === null || value === undefined) {
+      return false;
+    }
+    if (typeof value === "string") {
+      return value.trim().length > 0;
+    }
+    return true;
+  }
+
+  private toFieldLabel(field: string): string {
+    return this.fieldLabelMap[field] ?? field.replace(/_/g, " ");
+  }
+
+  private toFieldList(fields: string[]): string {
+    const labels = Array.from(
+      new Set(fields.map((field) => this.toFieldLabel(field))),
+    );
+    return labels.join(", ");
+  }
+
+  private getPageRequiredFields(pageId: string): {
+    orderRequired: string[];
+    shipRequired: string[];
+  } {
+    const cfg = this.pageOrderConfigs[pageId];
+
+    const orderRequired = (cfg?.orderCollectionConfig as any)?.required ??
+      (cfg?.orderCollectionConfig as any)?.requiredFields ?? [
+        "quantity",
+        "product_name",
+        "color",
+      ];
+
+    const shipRequired = (cfg?.orderShipConfig as any)?.required ??
+      (cfg?.orderShipConfig as any)?.requiredFields ?? ["phone", "address"];
+
+    return {
+      orderRequired: Array.isArray(orderRequired)
+        ? orderRequired
+        : ["quantity", "product_name", "color"],
+      shipRequired: Array.isArray(shipRequired)
+        ? shipRequired
+        : ["phone", "address"],
+    };
   }
 
   private async generateUserId(token: string): Promise<string> {
